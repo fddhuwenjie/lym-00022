@@ -1,23 +1,40 @@
 import curses
 import random
-from typing import Optional
+import time
+from typing import Optional, List, Dict
 from .courses import list_courses, get_course, Lesson
 from .typing_engine import TypingEngine
 from .storage import Storage, Record, CustomText
 from .visualizer import ASCIIChart, ChartData
+from .rhythm_visualizer import RhythmVisualizer
+from .drill_analyzer import DrillAnalyzer
+from .multiplayer import MultiplayerServer, MultiplayerClient
 from .config import (
     COLOR_CORRECT, COLOR_WRONG, COLOR_CURSOR, COLOR_PENDING,
-    COLOR_HIGHLIGHT, COLOR_MENU, DIFFICULTY_LEVELS
+    COLOR_HIGHLIGHT, COLOR_MENU, COLOR_RED, COLOR_BLUE, COLOR_MAGENTA,
+    DIFFICULTY_LEVELS, DEFAULT_MULTIPLAYER_PORT
 )
 
 
 class TypingTrainerCLI:
-    def __init__(self, stdscr):
+    def __init__(self, stdscr, mode: str = "normal",
+                 host_port: int = DEFAULT_MULTIPLAYER_PORT,
+                 join_addr: Optional[str] = None):
         self.stdscr = stdscr
         self.blind_mode = False
         self.time_limit: Optional[int] = None
         self.current_menu = "main"
         self.selected_idx = 0
+        self.mode = mode
+        self.host_port = host_port
+        self.join_addr = join_addr
+        self.server: Optional[MultiplayerServer] = None
+        self.client: Optional[MultiplayerClient] = None
+        self.multiplayer_players: List[Dict] = []
+        self.multiplayer_started = False
+        self.multiplayer_game_text = ""
+        self.multiplayer_result: Optional[Dict] = None
+        self.countdown = 0
         self._init_colors()
 
     def _init_colors(self):
@@ -29,11 +46,24 @@ class TypingTrainerCLI:
         curses.init_pair(COLOR_PENDING, curses.COLOR_WHITE, -1)
         curses.init_pair(COLOR_HIGHLIGHT, curses.COLOR_YELLOW, -1)
         curses.init_pair(COLOR_MENU, curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_RED, curses.COLOR_RED, -1)
+        curses.init_pair(COLOR_BLUE, curses.COLOR_BLUE, -1)
+        curses.init_pair(COLOR_MAGENTA, curses.COLOR_MAGENTA, -1)
 
     def run(self):
         curses.curs_set(0)
         self.stdscr.keypad(True)
-        self._main_loop()
+
+        if self.mode == "host":
+            self._run_host_mode()
+        elif self.mode == "join":
+            self._run_join_mode()
+        elif self.mode == "drill":
+            self._run_drill_mode()
+        elif self.mode == "rhythm_history":
+            self._run_rhythm_history()
+        else:
+            self._main_loop()
 
     def _main_loop(self):
         while True:
@@ -85,9 +115,12 @@ class TypingTrainerCLI:
         menu_items = [
             "1. 开始训练 - 选择课程",
             "2. 自定义文本",
-            "3. 历史记录",
-            "4. 进步曲线",
-            "5. 设置选项",
+            "3. 专项薄弱训练 (--drill)",
+            "4. 多人竞速对战",
+            "5. 历史记录",
+            "6. 进步曲线",
+            "7. 节奏评分历史",
+            "8. 设置选项",
             "0. 退出"
         ]
         
@@ -124,9 +157,9 @@ class TypingTrainerCLI:
     def _handle_main_menu_input(self, key: int) -> bool:
         if key == ord('q') or key == ord('Q'):
             return False
-        
-        menu_items = 6
-        
+
+        menu_items = 9
+
         if key == curses.KEY_UP:
             self.selected_idx = (self.selected_idx - 1) % menu_items
         elif key == curses.KEY_DOWN:
@@ -139,19 +172,25 @@ class TypingTrainerCLI:
                 self.current_menu = "custom"
                 self.selected_idx = 0
             elif self.selected_idx == 2:
+                self._run_drill_mode()
+            elif self.selected_idx == 3:
+                self._run_multiplayer_menu()
+            elif self.selected_idx == 4:
                 self.current_menu = "history"
                 self.selected_idx = 0
-            elif self.selected_idx == 3:
+            elif self.selected_idx == 5:
                 self.current_menu = "progress"
                 self.selected_idx = 0
-            elif self.selected_idx == 4:
+            elif self.selected_idx == 6:
+                self._run_rhythm_history()
+            elif self.selected_idx == 7:
                 self.current_menu = "settings"
                 self.selected_idx = 0
-            elif self.selected_idx == 5:
+            elif self.selected_idx == 8:
                 return False
         elif key == 27:
             return False
-        
+
         return True
 
     def _draw_courses_menu(self, max_y: int, max_x: int):
@@ -215,8 +254,9 @@ class TypingTrainerCLI:
         text = random.choice(course.texts)
         engine = TypingEngine(self.stdscr, text, self.blind_mode, self.time_limit)
         stats = engine.run()
-        
+
         if not engine.quit_early and stats.total_chars > 0:
+            rhythm_report = RhythmVisualizer.generate_rhythm_report(stats, width=60)
             record = Storage.create_record_from_stats(
                 stats,
                 course_id=course.id,
@@ -226,7 +266,7 @@ class TypingTrainerCLI:
                 is_custom=False
             )
             Storage.add_record(record)
-            engine.show_result()
+            engine.show_result(rhythm_report=rhythm_report)
 
     def _draw_custom_menu(self, max_y: int, max_x: int):
         self.stdscr.clear()
@@ -417,8 +457,9 @@ class TypingTrainerCLI:
         if content:
             engine = TypingEngine(self.stdscr, content, self.blind_mode, self.time_limit)
             stats = engine.run()
-            
+
             if not engine.quit_early and stats.total_chars > 0:
+                rhythm_report = RhythmVisualizer.generate_rhythm_report(stats, width=60)
                 record = Storage.create_record_from_stats(
                     stats,
                     course_id=None,
@@ -428,13 +469,14 @@ class TypingTrainerCLI:
                     is_custom=True
                 )
                 Storage.add_record(record)
-                engine.show_result()
+                engine.show_result(rhythm_report=rhythm_report)
 
     def _start_custom_practice(self, ct: CustomText):
         engine = TypingEngine(self.stdscr, ct.content, self.blind_mode, self.time_limit)
         stats = engine.run()
-        
+
         if not engine.quit_early and stats.total_chars > 0:
+            rhythm_report = RhythmVisualizer.generate_rhythm_report(stats, width=60)
             record = Storage.create_record_from_stats(
                 stats,
                 course_id=None,
@@ -444,7 +486,7 @@ class TypingTrainerCLI:
                 is_custom=True
             )
             Storage.add_record(record)
-            engine.show_result()
+            engine.show_result(rhythm_report=rhythm_report)
 
     def _draw_settings_menu(self, max_y: int, max_x: int):
         self.stdscr.clear()
@@ -691,3 +733,495 @@ class TypingTrainerCLI:
         if key == 27 or key == curses.KEY_ENTER or key == 10 or key == 13:
             self.current_menu = "main"
             self.selected_idx = 0
+
+    def _run_drill_mode(self):
+        analyzer = DrillAnalyzer()
+
+        if not analyzer.has_enough_history():
+            count = analyzer.get_history_count()
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+
+            title = "=== 专项薄弱训练 ==="
+            self.stdscr.addstr(2, (max_x - len(title)) // 2, title,
+                              curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD)
+
+            lines = [
+                f"您目前只有 {count} 次练习记录。",
+                f"专项训练需要至少 5 次练习记录来分析您的薄弱点。",
+                "",
+                "请先完成几次常规练习，然后再使用专项训练模式。",
+                "",
+                "薄弱分析将根据您的历史错字分布和按键停顿，",
+                "自动识别薄弱字符和双字母组合，生成针对性练习。"
+            ]
+
+            y = 5
+            for line in lines:
+                x = max(2, (max_x - len(line)) // 2)
+                self.stdscr.addstr(y, x, line, curses.color_pair(COLOR_PENDING))
+                y += 1
+
+            prompt = "按任意键返回主菜单..."
+            self.stdscr.addstr(max_y - 2, (max_x - len(prompt)) // 2, prompt,
+                              curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+            self.stdscr.refresh()
+            self.stdscr.getch()
+            return
+
+        if not analyzer.load_analysis():
+            return
+
+        drill_text = analyzer.generate_drill_text()
+        if not drill_text:
+            return
+
+        self.stdscr.clear()
+        max_y, max_x = self.stdscr.getmaxyx()
+
+        title = "=== 专项薄弱训练 ==="
+        self.stdscr.addstr(1, (max_x - len(title)) // 2, title,
+                          curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD)
+
+        summary = analyzer.get_weakness_summary()
+        self.stdscr.addstr(3, 2, "分析结果:", curses.color_pair(COLOR_HIGHLIGHT))
+        self.stdscr.addstr(4, 4, summary, curses.color_pair(COLOR_PENDING))
+
+        self.stdscr.addstr(6, 2, "练习文本预览 (前 200 字符):",
+                          curses.color_pair(COLOR_HIGHLIGHT))
+        preview = drill_text[:200] + ("..." if len(drill_text) > 200 else "")
+        y = 8
+        x = 4
+        for ch in preview:
+            if x >= max_x - 2:
+                y += 1
+                x = 4
+                if y >= max_y - 4:
+                    break
+            self.stdscr.addstr(y, x, ch, curses.color_pair(COLOR_PENDING))
+            x += 1
+
+        prompt = "按任意键开始练习，按 ESC 返回..."
+        self.stdscr.addstr(max_y - 2, (max_x - len(prompt)) // 2, prompt,
+                          curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+        self.stdscr.refresh()
+
+        key = self.stdscr.getch()
+        if key == 27:
+            return
+
+        def progress_cb(pos, wpm):
+            pass
+
+        engine = TypingEngine(
+            self.stdscr, drill_text, self.blind_mode, self.time_limit,
+            progress_callback=progress_cb
+        )
+        stats = engine.run()
+
+        if not engine.quit_early and stats.total_chars > 0:
+            stats.is_drill = True
+            stats.drill_weak_chars = analyzer.weak_chars
+            stats.drill_weak_bigrams = analyzer.weak_bigrams
+
+            rhythm_report = RhythmVisualizer.generate_rhythm_report(stats, width=60)
+            comparison = analyzer.compare_with_last_drill(
+                stats.wpm, stats.accuracy, stats.rhythm_score
+            )
+            comparison_bars = analyzer.get_comparison_bars(comparison)
+
+            record = Storage.create_record_from_stats(
+                stats,
+                course_id=None,
+                course_name="专项训练",
+                blind_mode=self.blind_mode,
+                time_limit=self.time_limit,
+                is_custom=False,
+                is_drill=True
+            )
+            Storage.add_record(record)
+            engine.show_result(
+                rhythm_report=rhythm_report,
+                drill_comparison=comparison_bars
+            )
+
+    def _draw_multiplayer_menu(self, max_y: int, max_x: int):
+        self.stdscr.clear()
+
+        title = "=== 多人竞速对战 ==="
+        self.stdscr.addstr(2, (max_x - len(title)) // 2, title,
+                          curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD)
+
+        menu_items = [
+            "1. 创建房间 (--host)",
+            "2. 加入房间 (--join)",
+            "0. 返回主菜单"
+        ]
+
+        start_y = 6
+        for i, item in enumerate(menu_items):
+            y = start_y + i * 2
+            x = (max_x - len(item)) // 2
+
+            if i == self.selected_idx:
+                self.stdscr.addstr(y, x, f"> {item}",
+                                  curses.color_pair(COLOR_CURSOR) | curses.A_BOLD)
+            else:
+                self.stdscr.addstr(y, x, f"  {item}",
+                                  curses.color_pair(COLOR_MENU))
+
+        hint = "使用 ↑↓ 选择，回车确认，ESC 返回"
+        self.stdscr.addstr(max_y - 2, (max_x - len(hint)) // 2, hint,
+                          curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+
+    def _run_multiplayer_menu(self):
+        max_y, max_x = self.stdscr.getmaxyx()
+        self._draw_multiplayer_menu(max_y, max_x)
+        self.stdscr.refresh()
+
+        while True:
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+
+            if key == 27:
+                break
+            elif key == curses.KEY_UP:
+                self.selected_idx = (self.selected_idx - 1) % 3
+            elif key == curses.KEY_DOWN:
+                self.selected_idx = (self.selected_idx + 1) % 3
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if self.selected_idx == 0:
+                    self.selected_idx = 0
+                    self._run_host_mode()
+                    break
+                elif self.selected_idx == 1:
+                    self.selected_idx = 0
+                    self._run_join_mode()
+                    break
+                elif self.selected_idx == 2:
+                    break
+
+            # Redraw the menu
+            max_y, max_x = self.stdscr.getmaxyx()
+            self._draw_multiplayer_menu(max_y, max_x)
+            self.stdscr.refresh()
+
+    def _run_host_mode(self):
+        self.server = MultiplayerServer(self.host_port)
+        if not self.server.start():
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+            msg = f"无法启动服务器，端口 {self.host_port} 可能已被占用。"
+            self.stdscr.addstr(max_y // 2, (max_x - len(msg)) // 2, msg,
+                              curses.color_pair(COLOR_RED))
+            self.stdscr.refresh()
+            time.sleep(2)
+            return
+
+        self.client = MultiplayerClient()
+        self.client.connect('127.0.0.1', self.host_port)
+
+        self._run_multiplayer_lobby(is_host=True)
+
+    def _run_join_mode(self):
+        if not self.join_addr:
+            curses.echo()
+            curses.curs_set(1)
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+
+            prompt = "请输入服务器地址 (格式: ip:port): "
+            self.stdscr.addstr(max_y // 2, 2, prompt, curses.color_pair(COLOR_HIGHLIGHT))
+            self.stdscr.refresh()
+
+            addr = ""
+            while True:
+                key = self.stdscr.getch()
+                if key in (curses.KEY_ENTER, 10, 13):
+                    break
+                elif key == 27:
+                    curses.noecho()
+                    curses.curs_set(0)
+                    return
+                elif key in (curses.KEY_BACKSPACE, 8, 127):
+                    if addr:
+                        addr = addr[:-1]
+                        y, x = self.stdscr.getyx()
+                        self.stdscr.addstr(y, x - 1, " ")
+                        self.stdscr.move(y, x - 1)
+                elif 32 <= key <= 126:
+                    addr += chr(key)
+
+            curses.noecho()
+            curses.curs_set(0)
+            self.join_addr = addr
+
+        if ':' not in self.join_addr:
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+            msg = "地址格式错误，请使用 ip:port 格式。"
+            self.stdscr.addstr(max_y // 2, (max_x - len(msg)) // 2, msg,
+                              curses.color_pair(COLOR_RED))
+            self.stdscr.refresh()
+            time.sleep(2)
+            return
+
+        host, port_str = self.join_addr.rsplit(':', 1)
+        try:
+            port = int(port_str)
+        except ValueError:
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+            msg = "端口号格式错误。"
+            self.stdscr.addstr(max_y // 2, (max_x - len(msg)) // 2, msg,
+                              curses.color_pair(COLOR_RED))
+            self.stdscr.refresh()
+            time.sleep(2)
+            return
+
+        self.client = MultiplayerClient()
+        if not self.client.connect(host, port):
+            self.stdscr.clear()
+            max_y, max_x = self.stdscr.getmaxyx()
+            msg = f"无法连接到 {host}:{port}"
+            self.stdscr.addstr(max_y // 2, (max_x - len(msg)) // 2, msg,
+                              curses.color_pair(COLOR_RED))
+            self.stdscr.refresh()
+            time.sleep(2)
+            return
+
+        self._run_multiplayer_lobby(is_host=False)
+
+    def _run_multiplayer_lobby(self, is_host: bool):
+        self.multiplayer_players = []
+        self.multiplayer_game_text = ""
+        self.multiplayer_started = False
+        self.countdown = 0
+        ready = False
+
+        def lobby_cb(players, game_text, started):
+            self.multiplayer_players = players
+            self.multiplayer_game_text = game_text
+            self.multiplayer_started = started
+
+        def countdown_cb(seconds):
+            self.countdown = seconds
+
+        def start_cb(game_text):
+            self.multiplayer_game_text = game_text
+            self.multiplayer_started = True
+
+        def progress_cb(players, total_chars):
+            self.multiplayer_players = players
+
+        def finish_cb(winner_id, players):
+            self.multiplayer_result = {
+                'winner_id': winner_id,
+                'players': players
+            }
+
+        self.client.lobby_callback = lobby_cb
+        self.client.countdown_callback = countdown_cb
+        self.client.start_callback = start_cb
+        self.client.progress_callback = progress_cb
+        self.client.finish_callback = finish_cb
+
+        self.stdscr.nodelay(True)
+
+        while True:
+            max_y, max_x = self.stdscr.getmaxyx()
+            self.stdscr.clear()
+
+            title = "=== 多人竞速大厅 ==="
+            self.stdscr.addstr(1, (max_x - len(title)) // 2, title,
+                              curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD)
+
+            if self.countdown > 0:
+                countdown_msg = f"游戏即将开始: {self.countdown}"
+                self.stdscr.addstr(3, (max_x - len(countdown_msg)) // 2, countdown_msg,
+                                  curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD)
+            elif self.countdown == 0 and self.multiplayer_started:
+                break
+
+            y = 6
+            header = f"{'玩家':<15}{'状态':<15}"
+            self.stdscr.addstr(y, 4, header, curses.color_pair(COLOR_HIGHLIGHT) | curses.A_UNDERLINE)
+            y += 2
+
+            for p in self.multiplayer_players:
+                name = p.get('name', 'Unknown')[:12]
+                is_ready = p.get('ready', False)
+                connected = p.get('connected', True)
+                is_self = p.get('id') == self.client.player_id
+
+                prefix = "★ " if is_self else "  "
+                status = ""
+                if not connected:
+                    status = "【已断开】"
+                    color = COLOR_RED
+                elif is_ready:
+                    status = "【已准备】"
+                    color = COLOR_CORRECT
+                else:
+                    status = "【等待中】"
+                    color = COLOR_PENDING
+
+                line = f"{prefix}{name:<15}{status}"
+                self.stdscr.addstr(y, 4, line, curses.color_pair(color))
+                y += 1
+
+            y += 1
+            if self.multiplayer_players:
+                connected = [p for p in self.multiplayer_players if p.get('connected', False)]
+                all_ready = all(p.get('ready', False) for p in connected)
+                if len(connected) < 2:
+                    hint = f"等待更多玩家加入 ({len(connected)}/2-4)"
+                    self.stdscr.addstr(y, 4, hint, curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+                elif not ready and not all_ready:
+                    hint = "按 SPACE 准备/取消准备"
+                    self.stdscr.addstr(y, 4, hint, curses.color_pair(COLOR_HIGHLIGHT))
+                elif ready:
+                    hint = "【已准备】 按 SPACE 取消准备"
+                    self.stdscr.addstr(y, 4, hint, curses.color_pair(COLOR_CORRECT))
+
+            if self.multiplayer_game_text:
+                y += 2
+                self.stdscr.addstr(y, 4, "练习文本预览:", curses.color_pair(COLOR_HIGHLIGHT))
+                preview = self.multiplayer_game_text[:80]
+                self.stdscr.addstr(y + 1, 6, preview, curses.color_pair(COLOR_PENDING))
+
+            exit_hint = "按 ESC 退出"
+            self.stdscr.addstr(max_y - 2, (max_x - len(exit_hint)) // 2, exit_hint,
+                              curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+
+            self.stdscr.refresh()
+
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+
+            if key == 27:
+                break
+            elif key == ord(' ') and not self.multiplayer_started and self.countdown == 0:
+                ready = not ready
+                self.client.send_ready(ready)
+
+            if not self.client.is_connected():
+                break
+
+            time.sleep(0.05)
+
+        if self.multiplayer_started and self.multiplayer_game_text:
+            self._run_multiplayer_game()
+
+        self.stdscr.nodelay(False)
+        if self.client:
+            self.client.close()
+        if self.server:
+            self.server.stop()
+
+    def _run_multiplayer_game(self):
+        def progress_cb(pos, wpm):
+            if self.client and self.client.is_connected():
+                self.client.send_progress(pos, wpm)
+
+        engine = TypingEngine(
+            self.stdscr, self.multiplayer_game_text,
+            self.blind_mode, self.time_limit,
+            progress_callback=progress_cb,
+            opponent_data=self.multiplayer_players
+        )
+
+        def opponent_update_thread():
+            while not engine.finished and not engine.quit_early:
+                time.sleep(0.1)
+                engine.opponent_data = list(self.multiplayer_players)
+
+        threading.Thread(target=opponent_update_thread, daemon=True).start()
+
+        stats = engine.run()
+        stats.__dict__['player_id'] = self.client.player_id
+
+        if not engine.quit_early and stats.total_chars > 0:
+            stats_dict = {
+                'wpm': stats.wpm,
+                'accuracy': stats.accuracy,
+                'total_chars': stats.total_chars,
+                'correct_chars': stats.correct_chars,
+                'wrong_chars': stats.wrong_chars,
+                'duration': stats.elapsed_time,
+                'rhythm_score': stats.rhythm_score
+            }
+            self.client.send_finish(stats_dict)
+
+            while not self.multiplayer_result and self.client.is_connected():
+                time.sleep(0.1)
+
+            rhythm_report = RhythmVisualizer.generate_rhythm_report(stats, width=60)
+
+            record = Storage.create_record_from_stats(
+                stats,
+                course_id=None,
+                course_name="多人竞速",
+                blind_mode=self.blind_mode,
+                time_limit=self.time_limit,
+                is_custom=False
+            )
+            Storage.add_record(record)
+            engine.show_result(
+                rhythm_report=rhythm_report,
+                multiplayer_result=self.multiplayer_result
+            )
+
+    def _run_rhythm_history(self):
+        history = Storage.get_recent_rhythm(10)
+        chart_lines = RhythmVisualizer.generate_rhythm_history_chart(
+            history, width=60, height=12
+        )
+
+        max_y, max_x = self.stdscr.getmaxyx()
+        self.stdscr.clear()
+
+        y = 1
+        for line in chart_lines:
+            if y >= max_y - 2:
+                break
+            x = max(2, (max_x - len(line)) // 2)
+
+            if line.startswith("=") or line.startswith("📊"):
+                attr = curses.color_pair(COLOR_HIGHLIGHT) | curses.A_BOLD
+            elif "ms │" in line:
+                parts = line.split("│", 1)
+                if len(parts) == 2:
+                    self.stdscr.addstr(y, 2, parts[0] + "│",
+                                      curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+                    plot_part = parts[1]
+                    x_pos = 2 + len(parts[0]) + 1
+                    for ci, ch in enumerate(plot_part):
+                        if ch in ('·', '●', '█', '░', '─', '└'):
+                            self.stdscr.addstr(y, x_pos + ci, ch,
+                                              curses.color_pair(COLOR_MENU))
+                        else:
+                            self.stdscr.addstr(y, x_pos + ci, ch)
+                    y += 1
+                    continue
+                attr = curses.color_pair(COLOR_PENDING)
+            elif "平均:" in line or "最佳:" in line:
+                attr = curses.color_pair(COLOR_HIGHLIGHT)
+            else:
+                attr = curses.color_pair(COLOR_PENDING)
+
+            try:
+                self.stdscr.addstr(y, x, line[:max_x - 4], attr)
+            except curses.error:
+                pass
+            y += 1
+
+        prompt = "按任意键返回..."
+        self.stdscr.addstr(max_y - 2, (max_x - len(prompt)) // 2, prompt,
+                          curses.color_pair(COLOR_PENDING) | curses.A_DIM)
+        self.stdscr.refresh()
+        self.stdscr.getch()
