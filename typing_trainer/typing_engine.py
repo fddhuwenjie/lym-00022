@@ -59,12 +59,16 @@ class TypingEngine:
                 max_y, max_x = self.stdscr.getmaxyx()
                 continue
             
-            if key < 32 or key > 126:
+            is_printable = (32 <= key <= 126) or key in (10, 13)
+            if not is_printable:
                 if key in (curses.KEY_BACKSPACE, 8, 127):
                     self._handle_backspace()
                 continue
             
-            char = chr(key)
+            if key in (10, 13):
+                char = '\n'
+            else:
+                char = chr(key)
             self._handle_keystroke(char)
         
         return self.stats
@@ -150,43 +154,68 @@ class TypingEngine:
         text = self.text
         pos = 0
         line_num = 0
+        x = 0
         
         while pos < len(text) and line_num < max_lines:
-            line_end = min(pos + max_x, len(text))
-            line = text[pos:line_end]
+            char = text[pos]
             
-            x = 0
-            for i, char in enumerate(line):
-                abs_pos = pos + i
-                
-                if abs_pos < self.current_pos:
-                    if self.blind_mode:
-                        display_char = ' '
-                    else:
-                        display_char = char if char != '\n' else ' '
+            if char == '\n':
+                if pos < self.current_pos:
                     color = curses.color_pair(COLOR_CORRECT)
-                elif abs_pos == self.current_pos:
-                    if self.blind_mode:
-                        display_char = '?'
-                    else:
-                        display_char = char if char != '\n' else ' '
+                elif pos == self.current_pos:
                     color = curses.color_pair(COLOR_CURSOR) | curses.A_REVERSE
                 else:
-                    if self.blind_mode:
-                        display_char = '·'
-                    else:
-                        display_char = char if char != '\n' else ' '
                     color = curses.color_pair(COLOR_PENDING)
+                
+                display_char = '$'
+                if self.blind_mode:
+                    if pos < self.current_pos:
+                        display_char = ' '
+                    elif pos == self.current_pos:
+                        display_char = '?'
+                    else:
+                        display_char = '·'
                 
                 try:
                     self.stdscr.addstr(start_y + line_num, x, display_char, color)
                 except curses.error:
                     pass
                 
-                x += 1
+                line_num += 1
+                x = 0
+                pos += 1
+                continue
             
-            pos = line_end
-            line_num += 1
+            if pos < self.current_pos:
+                if self.blind_mode:
+                    display_char = ' '
+                else:
+                    display_char = char
+                color = curses.color_pair(COLOR_CORRECT)
+            elif pos == self.current_pos:
+                if self.blind_mode:
+                    display_char = '?'
+                else:
+                    display_char = char
+                color = curses.color_pair(COLOR_CURSOR) | curses.A_REVERSE
+            else:
+                if self.blind_mode:
+                    display_char = '·'
+                else:
+                    display_char = char
+                color = curses.color_pair(COLOR_PENDING)
+            
+            try:
+                self.stdscr.addstr(start_y + line_num, x, display_char, color)
+            except curses.error:
+                pass
+            
+            x += 1
+            pos += 1
+            
+            if x >= max_x:
+                line_num += 1
+                x = 0
 
     def show_result(self):
         max_y, max_x = self.stdscr.getmaxyx()
