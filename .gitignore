@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+venv/
+*.db-shm
+*.db-wal
+.typing_data/
+.typing_trainer/
